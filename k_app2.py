@@ -1,147 +1,244 @@
+# streamlit run mark_ev_simple.py
+# -*- coding: utf-8 -*-
 import streamlit as st
+import numpy as np
 import pandas as pd
+import re
 
-st.title("ライン競輪スコア計算（7車ライン＋政春補正＋風向風速隊列対応版）")
+st.set_page_config(page_title="印だけでEV判定（簡易版）", layout="wide")
 
-# --- 入力UI ---
-kakushitsu_options = ['逃', '両', '追']
-symbol_input_options = ['◎', '〇', '▲', '△', '×', '無']
-
-st.header("【脚質入力】")
-kakushitsu = [st.selectbox(f"{i+1}番脚質", kakushitsu_options, key=f"kaku_{i}") for i in range(7)]
-
-st.header("【前走着順入力（1〜7着）】")
-chaku = [st.number_input(f"{i+1}番着順", min_value=1, max_value=7, value=5, step=1, key=f"chaku_{i}") for i in range(7)]
-
-st.header("【競争得点入力】")
-rating = [st.number_input(f"{i+1}番得点", value=55.0, step=0.1, key=f"rate_{i}") for i in range(7)]
-
-st.header("【隊列予想（数字、欠の場合は空欄）】")
-tairetsu = [st.text_input(f"{i+1}番隊列順位", key=f"tai_{i}") for i in range(7)]
-
-st.header("【ラインポジション入力（0単騎 1先頭 2番手 3三番手）】")
-line_order = [st.selectbox(f"{i+1}番ラインポジション", [0, 1, 2, 3], key=f"line_{i}") for i in range(7)]
-
-st.header("【政春印入力】")
-symbol = [st.selectbox(f"{i+1}番印", symbol_input_options, key=f"sym_{i}") for i in range(7)]
-
-st.header("【バンク・風条件】")
-st.markdown("### ホーム（上）- バック（下） 配置")
-wind_cols_top = st.columns(3)
-wind_cols_middle = st.columns(3)
-wind_cols_bottom = st.columns(3)
-
-if "selected_wind" not in st.session_state:
-    st.session_state.selected_wind = None
-
-with wind_cols_top[0]:
-    if st.button("左上"):
-        st.session_state.selected_wind = "左上"
-with wind_cols_top[1]:
-    if st.button("上"):
-        st.session_state.selected_wind = "上"
-with wind_cols_top[2]:
-    if st.button("右上"):
-        st.session_state.selected_wind = "右上"
-
-with wind_cols_middle[0]:
-    if st.button("左"):
-        st.session_state.selected_wind = "左"
-with wind_cols_middle[1]:
-    st.markdown("中央")
-with wind_cols_middle[2]:
-    if st.button("右"):
-        st.session_state.selected_wind = "右"
-
-with wind_cols_bottom[0]:
-    if st.button("左下"):
-        st.session_state.selected_wind = "左下"
-with wind_cols_bottom[1]:
-    if st.button("下"):
-        st.session_state.selected_wind = "下"
-with wind_cols_bottom[2]:
-    if st.button("右下"):
-        st.session_state.selected_wind = "右下"
-
-wind_speed = st.number_input("風速(m/s)", min_value=0.0, max_value=10.0, step=0.1)
-straight_length = st.number_input("みなし直線(m)", min_value=30, max_value=80, value=52, step=1)
-bank_angle = st.number_input("バンク角(°)", min_value=20.0, max_value=45.0, value=30.0, step=0.1)
-rain = st.checkbox("雨（滑走・慎重傾向あり）")
-
-st.header("【隊列ポジション選択】")
-position = st.selectbox("隊列ポジション", ["先頭", "2番手", "3番手", "単騎"])
-
-# --- 補正設定 ---
-wind_coefficients = {
-    "左上": 0.7, "上": 1.0, "右上": 0.7,
-    "左": 0.0, "右": 0.0,
-    "左下": -0.7, "下": -1.0, "右下": -0.7
+# ==== あなたの最新RANK_STATSをここに貼り替えOK（初期値は現行値）====
+RANK_STATS = {
+    "◎": {"p1": 0.200, "pTop2": 0.480, "pTop3": 0.610},
+    "〇": {"p1": 0.200, "pTop2": 0.390, "pTop3": 0.470},
+    "▲": {"p1": 0.100, "pTop2": 0.260, "pTop3": 0.430},
+    "△": {"p1": 0.130, "pTop2": 0.240, "pTop3": 0.400},
+    "×": {"p1": 0.190, "pTop2": 0.240, "pTop3": 0.410},
+    "α": {"p1": 0.133, "pTop2": 0.184, "pTop3": 0.347},
+    "β": {"p1": 0.108, "pTop2": 0.269, "pTop3": 0.409},
 }
+FALLBACK = "α"
 
-position_multipliers = {
-    "先頭": 1.0,
-    "2番手": 0.3,
-    "3番手": 0.1,
-    "単騎": 1.2
-}
+# ==== 期待値ルール（現行に合わせる）====
+P_FLOOR = {"sanpuku": 0.06, "nifuku": 0.12, "wide": 0.25, "nitan": 0.07, "santan": 0.03}
+E_MIN, E_MAX = 0.10, 0.60  # +10%〜+60%
 
-symbol_bonus = {'◎': 2.0, '〇': 1.5, '▲': 1.0, '△': 0.5, '×': 0.2, '無': 0.0}
-base_score = {'逃': 8, '両': 6, '追': 5}
+# ==== UI ====
+st.title("印だけでEV判定（◎〇▲△×αβ → 買える帯）")
+c1, c2, c3 = st.columns([2,2,3])
+with c1:
+    n_cars = st.selectbox("出走数", [5,6,7,8,9], index=2)
+with c2:
+    trials = st.slider("シミュレーション試行回数", 2000, 30000, 8000, 1000)
+with c3:
+    tau = st.slider("温度 τ（散らし具合）", 0.5, 2.0, 1.0, 0.1)
 
-# --- スコア計算 ---
-if st.button("スコア計算実行"):
+st.subheader("各車の印を入力（1〜{}）".format(n_cars))
+marks_input = {}
+cols = st.columns(9)
+for i in range(1, n_cars+1):
+    with cols[(i-1)%9]:
+        marks_input[i] = st.text_input(f"{i}番", value="" if i>3 else ("◎" if i==1 else ("〇" if i==2 else "▲")), max_chars=1)
 
-    # 有効な隊列リスト（欠番除外）
-    tairetsu_list = [i+1 for i, v in enumerate(tairetsu) if v.isdigit()]
+# ◎/〇/▲ の抽出（相手集合は 〇/▲）
+anchor = next((i for i,m in marks_input.items() if m=="◎"), None)
+mates = [i for i,m in marks_input.items() if m in ("〇","▲") and i!=anchor]
+all_others = [i for i in range(1, n_cars+1) if i!=anchor]
 
-    score_parts = []
+if anchor is None:
+    st.warning("◎ が未入力です。『◎』を1頭だけ指定してください。")
+    st.stop()
 
-    for i in range(7):
-        if not tairetsu[i].isdigit():
-            continue
-        num = i + 1
+# ==== 単一順位用の“強さベクトル”作成 ====
+#   印→(pTop3,pTop2,p1) を重みつき合成し、温度スケールで散らす
+w = np.zeros(n_cars, dtype=float)
+for idx, i in enumerate(range(1, n_cars+1)):
+    mk = marks_input.get(i, "")
+    if mk not in RANK_STATS: mk = FALLBACK
+    stat = RANK_STATS[mk]
+    # 合成強さ：Top3を主、Top2/1着を副（好みで微調整可）
+    base = 0.55*stat["pTop3"] + 0.30*stat["pTop2"] + 0.15*stat["p1"]
+    w[idx] = base
+# 温度 τ：τ<1でシャープ、>1で分散大きく
+w = np.power(np.clip(w, 1e-9, 1.0), 1.0/tau)
+w = w / w.sum()
 
-        base = base_score[kakushitsu[i]]
+# ==== 単一PLサンプルで一貫性を確保（Gumbel-Softmaxトリック）====
+rng = np.random.default_rng(20250906)
+def sample_order(weights: np.ndarray) -> list[int]:
+    g = -np.log(-np.log(np.clip(rng.random(len(weights)), 1e-12, 1-1e-12)))
+    score = np.log(weights+1e-12) + g
+    # 返すのは車番（1..n）
+    return (np.argsort(-score)+1).tolist()
 
-        # 新・風補正計算
-        if st.session_state.selected_wind:
-            wind_base = wind_coefficients.get(st.session_state.selected_wind, 0.0)
-            wind = wind_base * wind_speed * position_multipliers[position]
+# ==== カウント器 ====
+wide_counts = {k:0 for k in all_others}          # ◎-k がTop3内のワイド
+qn_counts   = {k:0 for k in all_others}          # 二車複（◎-k がTop2）
+ex_counts   = {k:0 for k in all_others}          # 二車単（◎→k）
+trioC_counts= {}                                  # 三連複C（◎-[相手]-全）
+st3_counts  = {}                                  # 三連単（◎→[相手]→全）
+
+# 三連複Cの対象トリプル列挙（◎ + [〇/▲のどちらかを含む] + もう1頭）
+trioC_list = []
+if mates:
+    for a in all_others:
+        for b in all_others:
+            if a>=b: continue
+            if (a in mates) or (b in mates):
+                t = tuple(sorted([anchor, a, b]))
+                trioC_list.append(t)
+    trioC_list = sorted(set(trioC_list))
+
+# ==== シミュレーション ====
+for _ in range(trials):
+    order = sample_order(w)  # 1回の試行で全券種イベントを整合的に評価
+    top3 = set(order[:3])
+    top2 = set(order[:2])
+
+    # ワイド（◎-k）
+    if anchor in top3:
+        for k in wide_counts.keys():
+            if k in top3:
+                wide_counts[k] += 1
+        # 三連複C
+        if mates and len(top3)==3:
+            others = sorted(list(top3 - {anchor}))
+            if len(others)==2:
+                a,b = others
+                if (a in mates) or (b in mates):
+                    trioC_counts[(min(anchor,a,b), sorted([anchor,a,b])[1], max(anchor,a,b))] = \
+                        trioC_counts.get((min(anchor,a,b), sorted([anchor,a,b])[1], max(anchor,a,b)), 0) + 1
+
+    # 二車複
+    if anchor in top2:
+        for k in qn_counts.keys():
+            if k in top2:
+                qn_counts[k] += 1
+
+    # 二車単/三連単
+    if order[0] == anchor:
+        k2 = order[1]
+        if k2 in ex_counts:
+            ex_counts[k2] += 1
+        if mates:
+            k3 = order[2]
+            if (k2 in mates) and (k3 not in (anchor, k2)):
+                st3_counts[(k2, k3)] = st3_counts.get((k2, k3), 0) + 1
+
+# ==== ユーティリティ ====
+def _key_nums(s): return list(map(int, re.findall(r"\d+", str(s))))
+def need_from_cnt(cnt:int) -> float|None:
+    if cnt<=0: return None
+    p = cnt/float(trials)
+    return round(1.0/p, 2)
+
+def band_from_p(p:float):
+    need = 1.0/max(p,1e-12)
+    return (need*(1.0+E_MIN), need*(1.0+E_MAX))
+
+# ==== 三連複C ====
+st.markdown("### 三連複C（◎-[相手]-全）")
+rows=[]
+for t in sorted(trioC_counts.keys() if trioC_counts else [], key=lambda x: (x[0],x[1],x[2])):
+    cnt = trioC_counts.get(t,0)
+    p = cnt/float(trials)
+    if p < P_FLOOR["sanpuku"]:  # Pフロア
+        continue
+    low, high = band_from_p(p)
+    rows.append({"買い目": f"{t[0]}-{t[1]}-{t[2]}", "p(想定的中率)": round(p,4), "買える帯": f"{low:.1f}〜{high:.1f}倍なら買い"})
+trioC_df = pd.DataFrame(rows)
+if not trioC_df.empty:
+    trioC_df = trioC_df.sort_values(by="買い目", key=lambda s: s.map(_key_nums)).reset_index(drop=True)
+    st.dataframe(trioC_df, use_container_width=True)
+else:
+    st.info("対象外（Pフロア未満 or 相手未設定）")
+
+# 三複バスケット合成オッズ（下限基準）と相手集合S
+S = set()
+O_combo = None
+if not trioC_df.empty:
+    need_list=[]
+    for _,r in trioC_df.iterrows():
+        nums = list(map(int, re.findall(r"\d+", r["買い目"])))
+        others = [x for x in nums if x != anchor]
+        S.update(others)
+        # 下限は “必要オッズ=1/p”
+        p = float(r["p(想定的中率)"])
+        if p>0: need_list.append(1.0/p)
+    if need_list:
+        denom = sum(1.0/x for x in need_list if x>0)
+        if denom>0:
+            O_combo = float(f"{(1.0/denom):.2f}")
+if O_combo is not None and len(S)>0:
+    st.caption(f"三連複バスケット合成オッズ（下限基準）：**{O_combo:.2f}倍** / 相手集合S：{sorted(S)}")
+
+# ==== ワイド（上限撤廃：Sは合成オッズ基準 / S外は必要オッズ基準）====
+st.markdown("### ワイド（◎-全）")
+rows=[]
+for k in sorted(wide_counts.keys()):
+    p = wide_counts[k]/float(trials)
+    if p < P_FLOOR["wide"]: continue
+    need = 1.0/p
+    rule = "必要オッズ以上"
+    ok = True
+    if (O_combo is not None) and (k in S):
+        if need >= O_combo:
+            rule = f"三複被り→合成{O_combo:.2f}倍以上"
         else:
-            wind = 0.0
+            ok = False
+    if ok:
+        rows.append({"買い目": f"{anchor}-{k}", "p(想定的中率)": round(p,4), "必要オッズ(=1/p)": round(need,2), "ルール": rule})
+wide_df = pd.DataFrame(rows)
+if not wide_df.empty:
+    wide_df = wide_df.sort_values(by="買い目", key=lambda s: s.map(_key_nums)).reset_index(drop=True)
+    st.dataframe(wide_df, use_container_width=True)
+    st.caption("※ワイドは上限撤廃：三連複で使用した相手は合成オッズ以上／三連複から漏れた相手は必要オッズ以上。")
+else:
+    st.info("対象外（Pフロア未満 or 合成基準で除外）")
 
-        # その他補正
-        pos_in_tairetsu = tairetsu_list.index(num)
-        tai = max(0, round(3.0 - 0.5 * pos_in_tairetsu, 1))
-        if kakushitsu[i] == '追' and 2 <= pos_in_tairetsu <= 4:
-            tai += 1.5
+# ==== 二車複 ====
+st.markdown("### 二車複（◎-全）")
+rows=[]
+for k in sorted(qn_counts.keys()):
+    p = qn_counts[k]/float(trials)
+    if p < P_FLOOR["nifuku"]: continue
+    low, high = band_from_p(p)
+    rows.append({"買い目": f"{anchor}-{k}", "p(想定的中率)": round(p,4), "買える帯": f"{low:.1f}〜{high:.1f}倍なら買い"})
+qn_df = pd.DataFrame(rows)
+if not qn_df.empty:
+    qn_df = qn_df.sort_values(by="買い目", key=lambda s: s.map(_key_nums)).reset_index(drop=True)
+    st.dataframe(qn_df, use_container_width=True)
+else:
+    st.info("対象外")
 
-        def score_from_chakujun(pos):
-            return 3.0 if pos == 1 else 2.5 if pos == 2 else 2.0 if pos == 3 else 1.0 if pos <= 6 else 0.0
+# ==== 二車単 ====
+st.markdown("### 二車単（◎→全）")
+rows=[]
+for k in sorted(ex_counts.keys()):
+    p = ex_counts[k]/float(trials)
+    if p < P_FLOOR["nitan"]: continue
+    low, high = band_from_p(p)
+    rows.append({"買い目": f"{anchor}->{k}", "p(想定的中率)": round(p,4), "買える帯": f"{low:.1f}〜{high:.1f}倍なら買い"})
+ex_df = pd.DataFrame(rows)
+if not ex_df.empty:
+    ex_df = ex_df.sort_values(by="買い目", key=lambda s: s.map(_key_nums)).reset_index(drop=True)
+    st.dataframe(ex_df, use_container_width=True)
+else:
+    st.info("対象外")
 
-        kasai = score_from_chakujun(chaku[i])
-        rating_score = max(0, round((sum(rating)/7 - rating[i]) * 0.2, 1))
-        rain_corr = {'逃': 2.5, '両': 0.5, '追': -2.5}[kakushitsu[i]] if rain else 0
-        symb = symbol_bonus[symbol[i]]
+# ==== 三連単（◎→[相手]→全）====
+st.markdown("### 三連単（◎→[相手]→全）")
+rows=[]
+for (sec, thr), cnt in st3_counts.items():
+    p = cnt/float(trials)
+    if p < P_FLOOR["santan"] or p<=0: continue
+    need = 1.0/p
+    low, high = need*(1.0+E_MIN), need*(1.0+E_MAX)
+    rows.append({"買い目": f"{anchor}->{sec}->{thr}", "p(想定的中率)": round(p,5), "買える帯": f"{low:.1f}〜{high:.1f}倍なら買い"})
+st_df = pd.DataFrame(rows)
+if not st_df.empty:
+    st_df = st_df.sort_values(by="買い目", key=lambda s: s.map(_key_nums)).reset_index(drop=True)
+    st.dataframe(st_df, use_container_width=True)
+else:
+    st.info("対象外")
 
-        def line_member_bonus(pos):
-            return {0: -1.0, 1: 2.0, 2: 1.5, 3: 1.0}.get(pos, 0.0)
-
-        def bank_character_bonus(kaku, angle, straight):
-            if straight <= 50 and angle >= 32:
-                return {'逃': 1.0, '両': 0, '追': -1.0}[kaku]
-            elif straight >= 58 and angle <= 31:
-                return {'逃': -1.0, '両': 0, '追': 1.0}[kaku]
-            return 0.0
-
-        line_bonus = line_member_bonus(line_order[i])
-        bank_bonus = bank_character_bonus(kakushitsu[i], bank_angle, straight_length)
-
-        total = base + wind + tai + kasai + rating_score + rain_corr + symb + line_bonus + bank_bonus
-
-        score_parts.append((num, kakushitsu[i], base, wind, tai, kasai, rating_score, rain_corr, symb, line_bonus, bank_bonus, total))
-
-    df = pd.DataFrame(score_parts, columns=['車番', '脚質', '基本', '風補正', '隊列補正', '着順補正', '得点補正', '雨補正', '政春印補正', 'ライン補正', 'バンク補正', '合計スコア'])
-    df_sorted = df.sort_values(by='合計スコア', ascending=False).reset_index(drop=True)
-
-    st.dataframe(df_sorted)
