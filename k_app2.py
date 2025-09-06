@@ -185,7 +185,7 @@ elif confidence == "混戦":
 # 出力
 # ==============================
 st.markdown(f"### 展開評価：**{confidence}**")
-st.caption(f"印：{'  '.join(f'{i}番:{marks_input[i] or \"(未)\"}' for i in range(1, n_cars+1))}")
+st.caption(f"印：{'  '.join(f'{i}番:{marks_input[i] or "(未)"}' for i in range(1, n_cars+1))}")
 
 # 三連複C
 st.markdown("#### 三連複C（◎-[相手]-全）※車番順")
@@ -263,3 +263,4 @@ else:
     st.info("対象外")
 
 st.caption("※ワイドは『必要オッズ以上で買い』。他は『買える帯』で買い。Pフロア未満はどんなオッズでも買わない。")
+
