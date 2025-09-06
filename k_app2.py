@@ -125,16 +125,213 @@ for _ in range(trials):
             if (k2 in mates) and (k3 not in (anchor, k2)):
                 st3_counts[(k2, k3)] = st3_counts.get((k2, k3), 0) + 1
 
-# ==== ユーティリティ ====
-def _key_nums(s): return list(map(int, re.findall(r"\d+", str(s))))
-def need_from_cnt(cnt:int) -> float|None:
-    if cnt<=0: return None
-    p = cnt/float(trials)
-    return round(1.0/p, 2)
+# ==============================
+# ユーティリティ
+# ==============================
+def clamp(x,a,b): return max(a, min(b, x))
 
-def band_from_p(p:float):
-    need = 1.0/max(p,1e-12)
-    return (need*(1.0+E_MIN), need*(1.0+E_MAX))
+def zscore_list(arr):
+    arr = np.array(arr, dtype=float)
+    m, s = float(np.mean(arr)), float(np.std(arr))
+    return np.zeros_like(arr) if s==0 else (arr-m)/s
+
+def zscore_val(x, xs):
+    xs = np.array(xs, dtype=float); m, s = float(np.mean(xs)), float(np.std(xs))
+    return 0.0 if s==0 else (float(x)-m)/s
+
+def extract_car_list(s, nmax):
+    s = str(s or "").strip()
+    return [int(c) for c in s if c.isdigit() and 1 <= int(c) <= nmax]
+
+def build_line_maps(lines):
+    labels = "ABCDEFG"
+    line_def = {labels[i]: lst for i,lst in enumerate(lines) if lst}
+    car_to_group = {c:g for g,mem in line_def.items() for c in mem}
+    return line_def, car_to_group
+
+def role_in_line(car, line_def):
+    for g, mem in line_def.items():
+        if car in mem:
+            if len(mem)==1: return 'single'
+            idx = mem.index(car)
+            return ['head','second','thirdplus'][idx] if idx<3 else 'thirdplus'
+    return 'single'
+
+def pos_coeff(role, line_factor):
+    base = {'head':1.0,'second':0.7,'thirdplus':0.5,'single':0.9}.get(role,0.9)
+    return base * line_factor
+
+def tenscore_correction(tenscores):
+    n = len(tenscores)
+    if n<=2: return [0.0]*n
+    df = pd.DataFrame({"得点":tenscores})
+    df["順位"] = df["得点"].rank(ascending=False, method="min").astype(int)
+    hi = min(n,8); baseline = df[df["順位"].between(2,hi)]["得点"].mean()
+    def corr(row): return round(abs(baseline-row["得点"])*0.03, 3) if row["順位"] in [2,3,4] else 0.0
+    return df.apply(corr, axis=1).tolist()
+
+def wind_adjust(wind_dir, wind_speed, role, prof_escape):
+    if wind_dir=="無風" or wind_speed==0: return 0.0
+    wd = WIND_COEFF.get(wind_dir,0.0)
+    pos_multi = {'head':0.32,'second':0.30,'thirdplus':0.25,'single':0.30}.get(role,0.30)
+    coeff = 0.4 + 0.6*prof_escape
+    val = wind_speed * wd * pos_multi * coeff
+    return round(clamp(val, -0.05, 0.05), 3)
+
+def bank_character_bonus(bank_angle, straight_length, prof_escape, prof_sashi):
+    straight_factor = (float(straight_length)-40.0)/10.0
+    angle_factor = (float(bank_angle)-25.0)/5.0
+    total = clamp(-0.1*straight_factor + 0.1*angle_factor, -0.05, 0.05)
+    return round(total*prof_escape - 0.5*total*prof_sashi, 3)
+
+def bank_length_adjust(bank_length, prof_oikomi):
+    delta = clamp((float(bank_length)-411.0)/100.0, -0.05, 0.05)
+    return round(delta*prof_oikomi, 3)
+
+def compute_lineSB_bonus(line_def, S, B, line_factor=1.0, exclude=None, cap=0.06, enable=True):
+    if not enable or not line_def:
+        return {g:0.0 for g in line_def.keys()} if line_def else {}, {}
+    w_pos_base = {'head':1.0,'second':0.4,'thirdplus':0.2,'single':0.7}
+    Sg, Bg = {}, {}
+    for g, mem in line_def.items():
+        s=b=0.0
+        for car in mem:
+            if exclude is not None and car==exclude: continue
+            w = w_pos_base[role_in_line(car, line_def)] * line_factor
+            s += w*float(S.get(car,0)); b += w*float(B.get(car,0))
+        Sg[g]=s; Bg[g]=b
+    raw={}
+    for g in line_def.keys():
+        s, b = Sg[g], Bg[g]
+        ratioS = s/(s+b+1e-6)
+        raw[g] = (0.6*b + 0.4*s) * (0.6 + 0.4*ratioS)
+    zz = zscore_list(list(raw.values())) if raw else []
+    bonus={g: clamp(0.02*float(zz[i]), -cap, cap) for i,g in enumerate(raw.keys())}
+    return bonus, raw
+
+def input_float_text(label: str, key: str, placeholder: str = "") -> float | None:
+    s = st.text_input(label, value=st.session_state.get(key, ""), key=key, placeholder=placeholder)
+    ss = unicodedata.normalize("NFKC", str(s)).replace(",", "").strip()
+    if ss == "": return None
+    if not re.fullmatch(r"[+-]?\d+(\.\d+)?", ss):
+        st.warning(f"{label} は数値で入力してください（入力値: {s}）")
+        return None
+    return float(ss)
+
+# --- 印の正規化ユーティリティ ---
+MARKS = ['◎','〇','▲','△','×','α','β']
+NUM_TO_MARK = {str(i+1): m for i, m in enumerate(MARKS)}
+ALIAS = {'○': '〇','◯': '〇','O':'〇','o':'〇'}
+
+def normalize_mark(v: str | int | None):
+    if v is None: return None
+    s = str(v).strip()
+    if not s: return None
+    if s.isdigit() and s in NUM_TO_MARK:  # 数字を印に変換
+        return NUM_TO_MARK[s]
+    s = ALIAS.get(s, s)  # ゆらぎ吸収
+    if s in MARKS: return s
+    return None
+
+# --- KOユーティリティ（ライン対ラインの勝ち上がりシード） ---
+def _role_of(car, mem):
+    if len(mem)==1: return 'single'
+    i = mem.index(car)
+    return ['head','second','thirdplus'][i] if i<3 else 'thirdplus'
+
+def _line_strength_raw(line_def, S, B, line_factor=1.0):
+    if not line_def: return {}
+    w_pos = {'head':1.0,'second':0.4,'thirdplus':0.2,'single':0.7}
+    raw={}
+    for g, mem in line_def.items():
+        s=b=0.0
+        for c in mem:
+            w = w_pos[_role_of(c, mem)] * line_factor
+            s += w*float(S.get(c,0)); b += w*float(B.get(c,0))
+        ratioS = s/(s+b+1e-6)
+        raw[g] = (0.6*b + 0.4*s) * (0.6 + 0.4*ratioS)
+    return raw
+
+def _top2_lines(line_def, S, B, line_factor=1.0):
+    raw = _line_strength_raw(line_def, S, B, line_factor)
+    order = sorted(raw.keys(), key=lambda g: raw[g], reverse=True)
+    return (order[0], order[1]) if len(order)>=2 else (order[0], None) if order else (None, None)
+
+def _extract_role_car(line_def, gid, role_name):
+    if gid is None or gid not in line_def: return None
+    mem = line_def[gid]
+    if role_name=='head':    return mem[0] if len(mem)>=1 else None
+    if role_name=='second':  return mem[1] if len(mem)>=2 else None
+    return None
+
+def _ko_order(v_base_map, line_def, S, B, line_factor=1.0, gap_delta=0.010):
+    cars = list(v_base_map.keys())
+    if not line_def or len(line_def)<1:
+        return [c for c,_ in sorted(v_base_map.items(), key=lambda x:x[1], reverse=True)]
+
+    g1, g2 = _top2_lines(line_def, S, B, line_factor)
+    head1 = _extract_role_car(line_def, g1, 'head')
+    head2 = _extract_role_car(line_def, g2, 'head')
+    sec1  = _extract_role_car(line_def, g1, 'second')
+    sec2  = _extract_role_car(line_def, g2, 'second')
+
+    others=[]
+    if g1:
+        mem = line_def[g1]
+        if len(mem)>=3: others += mem[2:]
+    if g2:
+        mem = line_def[g2]
+        if len(mem)>=3: others += mem[2:]
+    for g, mem in line_def.items():
+        if g not in {g1,g2}:
+            others += mem
+
+    order = []
+    head_pair = [x for x in [head1, head2] if x is not None]
+    order += sorted(head_pair, key=lambda c: v_base_map.get(c, -1e9), reverse=True)
+    sec_pair = [x for x in [sec1, sec2] if x is not None]
+    order += sorted(sec_pair, key=lambda c: v_base_map.get(c, -1e9), reverse=True)
+
+    others = list(dict.fromkeys([c for c in others if c is not None]))
+    others_sorted = sorted(others, key=lambda c: v_base_map.get(c, -1e9), reverse=True)
+    order += [c for c in others_sorted if c not in order]
+
+    for c in cars:
+        if c not in order:
+            order.append(c)
+
+    def _same_group(a,b):
+        if a is None or b is None: return False
+        ga = next((g for g,mem in line_def.items() if a in mem), None)
+        gb = next((g for g,mem in line_def.items() if b in mem), None)
+        return ga is not None and ga==gb
+
+    i=0
+    while i < len(order)-2:
+        a, b, c = order[i], order[i+1], order[i+2]
+        if _same_group(a, b):
+            vx = v_base_map.get(b,0.0) - v_base_map.get(c,0.0)
+            if vx >= -gap_delta:
+                order.pop(i+2)
+                order.insert(i+1, b)
+        i += 1
+
+    return order
+
+# ヘルパー：オッズ帯
+def _zone_from_p(p: float):
+    needed = 1.0 / max(p, 1e-12)
+    return needed, needed*(1.0+E_MIN), needed*(1.0+E_MAX)
+
+def _format_line_zone(name: str, bet_type: str, p: float) -> str | None:
+    floor = P_FLOOR[bet_type]
+    if p < floor: return None
+    _, low, high = _zone_from_p(p)
+    return f"{name}：{low:.1f}〜{high:.1f}倍なら買い"
+
+def _sort_key_by_numbers(name: str) -> list[int]:
+    return list(map(int, re.findall(r"\d+", str(name))))
+
 
 # ==== 三連複C ====
 st.markdown("### 三連複C（◎-[相手]-全）")
@@ -241,4 +438,5 @@ if not st_df.empty:
     st.dataframe(st_df, use_container_width=True)
 else:
     st.info("対象外")
+
 
