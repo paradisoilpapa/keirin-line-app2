@@ -214,6 +214,98 @@ st.markdown("#### 三連単（◎→[相手]→全）※車番順")
 st.dataframe(santan_df, use_container_width=True)
 
 # ==============================
+# 上位5車BOX（印優先）トグル
+# ==============================
+st.markdown("---")
+show_box = st.checkbox("上位5車のBOX買いを表示（印優先）", value=False,
+                       help="印の強さで5車を自動選出（◎>〇>▲>△>×>α>β）。未指定はα扱い。")
+
+if show_box:
+    st.markdown("### 🧺 上位5車BOX（印優先）")
+
+    # 印の優先度（高→低）
+    MARK_PRI = {"◎": 6, "〇": 5, "▲": 4, "△": 3, "×": 2, "α": 1, "β": 0}
+    def mark_score(mk: str) -> int:
+        return MARK_PRI.get(mk, MARK_PRI["α"])
+
+    # 全車を（印スコア desc, 車番 asc）で並べ、先頭5車をBOX対象に
+    all_cars = sorted(
+        [(i, mark_score(car_mark[i])) for i in range(1, n_cars+1)],
+        key=lambda x: (-x[1], x[0])
+    )
+    box_cars = [i for (i, _) in all_cars[:min(5, n_cars)]]
+    st.caption(f"BOX対象：{box_cars}（印優先で自動選出）")
+
+    # 共通：数字抽出ソートキー
+    numkey = lambda s: list(map(int, re.findall(r"\d+", str(s))))
+
+    # ---- ワイド（5車BOX：全ての組合せ）----
+    rows = []
+    for i in range(len(box_cars)):
+        for j in range(i+1, len(box_cars)):
+            a, b = box_cars[i], box_cars[j]
+            p = p3[a] * p3[b]              # 独立近似（両者Top3）
+            rows.append({"買い目": f"{a}-{b}", "想定p": round(p,4), "バランス帯": band_from_p(p)})
+    wide_box_df = pd.DataFrame(rows).sort_values(by="買い目", key=lambda s: s.map(numkey)).reset_index(drop=True)
+
+    # ---- 二車複（5車BOX）----
+    rows = []
+    for i in range(len(box_cars)):
+        for j in range(i+1, len(box_cars)):
+            a, b = box_cars[i], box_cars[j]
+            p = p2[a] * p2[b]              # 独立近似（両者Top2）
+            rows.append({"買い目": f"{a}-{b}", "想定p": round(p,4), "バランス帯": band_from_p(p)})
+    qn_box_df = pd.DataFrame(rows).sort_values(by="買い目", key=lambda s: s.map(numkey)).reset_index(drop=True)
+
+    # ---- 三連複（5車BOX：3通り全組合せ）----
+    rows = []
+    for i in range(len(box_cars)):
+        for j in range(i+1, len(box_cars)):
+            for k in range(j+1, len(box_cars)):
+                a, b, c = box_cars[i], box_cars[j], box_cars[k]
+                p = p3[a] * p3[b] * p3[c]   # 独立近似（3者Top3）
+                rows.append({"買い目": f"{a}-{b}-{c}", "想定p": round(p,5), "バランス帯": band_from_p(p)})
+    trio_box_df = pd.DataFrame(rows).sort_values(by="買い目", key=lambda s: s.map(numkey)).reset_index(drop=True)
+
+    # ---- 二車単（5車BOX：順序あり全通り）----
+    rows = []
+    for i in range(len(box_cars)):
+        for j in range(len(box_cars)):
+            if i == j: continue
+            a, b = box_cars[i], box_cars[j]
+            p = p1[a] * p2[b]              # 近似：1着a × bが連対圏
+            rows.append({"買い目": f"{a}->{b}", "想定p": round(p,5), "バランス帯": band_from_p(p)})
+    ex_box_df = pd.DataFrame(rows).sort_values(by="買い目", key=lambda s: s.map(numkey)).reset_index(drop=True)
+
+    # ---- 三連単（5車BOX：順序あり全通り=5P3=60）----
+    rows = []
+    for a in box_cars:
+        for b in box_cars:
+            if b == a: continue
+            for c in box_cars:
+                if c == a or c == b: continue
+                p = p1[a] * p2[b] * p3[c]   # 近似：1着a × 2着b連対 × 3着cTop3
+                rows.append({"買い目": f"{a}->{b}->{c}", "想定p": round(p,6), "バランス帯": band_from_p(p)})
+    st_box_df = pd.DataFrame(rows).sort_values(by="買い目", key=lambda s: s.map(numkey)).reset_index(drop=True)
+
+    # 表示（重い場合は必要な券種だけに絞ってもOK）
+    st.markdown("#### ワイド（5車BOX）")
+    st.dataframe(wide_box_df, use_container_width=True)
+
+    st.markdown("#### 二車複（5車BOX）")
+    st.dataframe(qn_box_df, use_container_width=True)
+
+    st.markdown("#### 三連複（5車BOX）")
+    st.dataframe(trio_box_df, use_container_width=True)
+
+    st.markdown("#### 二車単（5車BOX）")
+    st.dataframe(ex_box_df, use_container_width=True)
+
+    st.markdown("#### 三連単（5車BOX）")
+    st.dataframe(st_box_df, use_container_width=True)
+
+
+# ==============================
 # メモ用（note貼り付けスタイル）
 # ==============================
 st.markdown("### 📝 コピー用（note貼り付けスタイル）")
@@ -234,4 +326,5 @@ note_text = (
     + "※このオッズ以下は期待値以下を想定しています。また、このオッズから高オッズに離れるほどに的中率バランスが崩れハイリスクになります。"
 )
 st.text_area("ここを選択してコピー", note_text, height=320)
+
 
