@@ -1,279 +1,239 @@
 # -*- coding: utf-8 -*-
-# 政春さんの「印だけ」EVバランス帯チェッカー（軽量版）
 import streamlit as st
-import pandas as pd
 import numpy as np
+import pandas as pd
 import re
 
-st.set_page_config(page_title="政春版：印→EVバランス帯チェッカー", layout="centered")
+st.set_page_config(page_title="政春さん向け：印→EVバランス帯", layout="wide")
 
-# ===== 固定パラメータ =====
-RANK_STATS = {
-    "◎": {"p1": 0.200, "pTop2": 0.480, "pTop3": 0.610},
-    "〇": {"p1": 0.200, "pTop2": 0.390, "pTop3": 0.470},
-    "▲": {"p1": 0.100, "pTop2": 0.260, "pTop3": 0.430},
-    "△": {"p1": 0.130, "pTop2": 0.240, "pTop3": 0.400},
-    "×": {"p1": 0.190, "pTop2": 0.240, "pTop3": 0.410},
-    "α": {"p1": 0.133, "pTop2": 0.184, "pTop3": 0.347},
-    "β": {"p1": 0.108, "pTop2": 0.269, "pTop3": 0.409},
+st.title("🎯 印だけ入れて期待値レンジ（バランス帯）を見る簡易版")
+
+# ========= パラメータ =========
+st.sidebar.header("設定")
+n_cars = st.sidebar.selectbox("出走数（5〜9）", [5,6,7,8,9], index=2)
+trials = st.sidebar.slider("シミュレーション回数", 2000, 20000, 8000, 1000)
+seed   = st.sidebar.number_input("乱数シード", value=20250904, step=1)
+
+# EV 下限（=Pフロア）と バランス帯（=必要オッズ×(1+α〜1+β)）
+P_FLOOR = {"wide": 0.25, "nifuku": 0.12, "nitan": 0.07, "sanpuku": 0.06, "santan": 0.03}
+E_MIN, E_MAX = 0.10, 0.60  # バランス帯：+10%〜+60%
+
+st.sidebar.caption("Pフロア（最低想定的中率）: ワイド25%/二複12%/二単7%/三複6%/三単3%")
+st.sidebar.caption("バランス帯: 必要オッズ×(1+10%〜1+60%)")
+
+# ========= 印入力（一記号一数字） =========
+st.subheader("印入力（1記号=1車番）")
+cols = st.columns(7)
+with cols[0]: car_om = st.number_input("◎", min_value=1, max_value=n_cars, value=1, step=1, key="om")  # 本命（必須）
+with cols[1]: car_mr = st.number_input("〇", min_value=1, max_value=n_cars, value=min(2,n_cars), step=1, key="mr")
+with cols[2]: car_an = st.number_input("▲", min_value=1, max_value=n_cars, value=min(3,n_cars), step=1, key="an")
+with cols[3]: car_dt = st.number_input("△", min_value=1, max_value=n_cars, value=min(4,n_cars), step=1, key="dt")
+with cols[4]: car_x  = st.number_input("×", min_value=1, max_value=n_cars, value=min(5,n_cars), step=1, key="xx")
+with cols[5]: car_a  = st.number_input("α", min_value=1, max_value=n_cars, value=min(6,n_cars), step=1, key="aa")
+with cols[6]: car_b  = st.number_input("β", min_value=1, max_value=n_cars, value=min(7,n_cars), step=1, key="bb")
+
+marks_input = {"◎":int(car_om), "〇":int(car_mr), "▲":int(car_an), "△":int(car_dt),
+               "×":int(car_x), "α":int(car_a), "β":int(car_b)}
+
+# 同一車重複を許す（手入力優先）。未指定車は「無印」として扱う
+mark_by_car = {i:"無" for i in range(1, n_cars+1)}
+for mk, car in marks_input.items():
+    if 1 <= car <= n_cars:
+        mark_by_car[car] = mk
+
+st.caption("印： " + "  ".join(f"{i}番:{mark_by_car[i]}" for i in range(1, n_cars+1)))
+
+# ========= 印→確率倍率（連続係数） =========
+# ここは“固定テンプレ”。αとβは同値、無印もβと同値にしています。
+MARK_MUL = {
+    # p1/p2/p3 それぞれの倍率。相対比だけを使い、最後は正規化します。
+    "◎": {"p1":1.15, "p2":1.08, "p3":1.05},
+    "〇": {"p1":1.05, "p2":1.04, "p3":1.03},
+    "▲": {"p1":0.98, "p2":1.02, "p3":1.03},
+    "△": {"p1":0.96, "p2":0.99, "p3":1.01},
+    "×": {"p1":0.95, "p2":0.98, "p3":1.00},
+    "α": {"p1":0.97, "p2":0.99, "p3":1.01},
+    "β": {"p1":0.97, "p2":0.99, "p3":1.01},
+    "無": {"p1":0.97, "p2":0.99, "p3":1.01},  # 無印＝βと同値
 }
-FALLBACK = "α"   # 未指定の車に与える印
 
-# EV判定帯（オッズ=必要オッズ×(1+E_MIN〜E_MAX)）
-E_MIN, E_MAX = 0.10, 0.60
+# ========= 確率ベクトルを作成 =========
+def build_probs(n, which:"p1|p2|p3"):
+    base = np.ones(n, dtype=float)/n  # ベースは一様
+    m = np.array([MARK_MUL.get(mark_by_car[i+1], MARK_MUL["無"])[which] for i in range(n)], dtype=float)
+    p = base * m
+    p = p / p.sum()
+    return p
 
-# Pフロア（この想定的中率未満は対象外）
-P_FLOOR = {"wide":0.25, "nifuku":0.12, "nitan":0.07, "sanpuku":0.06, "santan":0.03}
+probs_p1 = build_probs(n_cars, "p1")  # 1着用（→二車単/三連単）
+probs_p2 = build_probs(n_cars, "p2")  # Top2用（→二車複）
+probs_p3 = build_probs(n_cars, "p3")  # Top3用（→ワイド/三連複）
 
-def _sort_key_nums(name: str):
-    return list(map(int, re.findall(r"\d+", str(name))))
-
-st.title("🎯 政春版：印→EVバランス帯（ワンタッチ）")
-
-# ===== 入力：頭数・印 =====
-cols_top = st.columns(3)
-with cols_top[0]:
-    n_cars = st.selectbox("出走数", [5,6,7,8,9], index=2)
-with cols_top[1]:
-    trials = st.slider("シミュレーション回数", 1000, 20000, 8000, 1000)
-with cols_top[2]:
-    seed = st.number_input("乱数シード", value=20250904, step=1)
-
-st.markdown("#### 印の割り当て（各記号 = 1台）")
-st.caption("未入力の車は自動で **α/β** を使い確率校正します（期待値漏れを防止）。")
-
-marks = ["◎","〇","▲","△","×","α","β"]
-sel = {}
-c1, c2, c3, c4 = st.columns(4)
-with c1:
-    sel["◎"] = st.number_input("◎", 1, n_cars, 1, key="m_wheel")
-    sel["〇"] = st.number_input("〇", 1, n_cars, min(2, n_cars), key="m_maru")
-with c2:
-    sel["▲"] = st.number_input("▲", 1, n_cars, min(3, n_cars), key="m_san")
-    sel["△"] = st.number_input("△", 1, n_cars, min(4, n_cars), key="m_shita")
-with c3:
-    sel["×"] = st.number_input("×", 1, n_cars, min(5, n_cars), key="m_batsu")
-    sel["α"] = st.number_input("α", 1, n_cars, min(6, n_cars), key="m_alpha")
-with c4:
-    sel["β"] = st.number_input("β", 1, n_cars, min(7, n_cars), key="m_beta")
-
-# 同じ車に複数記号が付いたら後勝ちで上書き（◎を先にチェック→最後にβ…の順）
-order_apply = ["β","α","×","△","▲","〇","◎"]  # 弱→強の順で最終上書き＝強印優先
-mark_by_car = {i: None for i in range(1, n_cars+1)}
-for mk in order_apply:
-    car = sel.get(mk, None)
-    if car is not None and 1 <= int(car) <= n_cars:
-        mark_by_car[int(car)] = mk
-
-# フォールバック印補完（未指定はαに寄せる）
-for i in range(1, n_cars+1):
-    if mark_by_car[i] is None:
-        mark_by_car[i] = FALLBACK
-
-st.caption("割り当て結果：" + "  ".join([f"{i}番:{mark_by_car[i]}" for i in range(1, n_cars+1)]))
-
-# ===== baseを均等→印で確率校正（p1, pTop2, pTop3 別々に正規化） =====
-base = np.ones(n_cars, dtype=float) / n_cars
-
-def calibrate(base_vec: np.ndarray, key: str) -> np.ndarray:
-    m = np.ones(n_cars, dtype=float)
-    for idx, car in enumerate(range(1, n_cars+1)):
-        mk = mark_by_car[car]
-        tgt = float(RANK_STATS.get(mk, RANK_STATS[FALLBACK])[key])
-        # ratioの平方根で過補正を緩和
-        ratio = tgt / max(float(base_vec[idx]), 1e-9)
-        m[idx] = float(np.clip(ratio**0.5, 0.25, 2.5))
-    pv = base_vec * m
-    pv = pv / pv.sum()
-    return pv
-
-p3 = calibrate(base, "pTop3")
-p2 = calibrate(base, "pTop2")
-p1 = calibrate(base, "p1")
-
+# ========= PL風サンプラー =========
 rng = np.random.default_rng(int(seed))
-
-def sample_order(pvec: np.ndarray) -> list[int]:
-    # Gumbel-max trick for PL近似
+def sample_order_from_probs(pvec: np.ndarray) -> list[int]:
+    # Gumbel-Max trick
     g = -np.log(-np.log(np.clip(rng.random(len(pvec)), 1e-12, 1-1e-12)))
     score = np.log(pvec+1e-12) + g
-    return (np.argsort(-score)+1).tolist()
+    return (np.argsort(-score)+1).tolist()  # 1-indexed車番
 
-# ◎から固定
-one = sel["◎"]
-mates = [sel["〇"], sel["▲"]]  # 三連複C, 三連単の2着候補
-others = [i for i in range(1, n_cars+1) if i != one]
+# ========= カウント器セットアップ =========
+om = marks_input["◎"]
+all_others = [i for i in range(1, n_cars+1) if i != om]
 
-# カウント器
-wide_ct = {k:0 for k in others}
-qn_ct   = {k:0 for k in others}
-ex_ct   = {k:0 for k in others}
-triC_ct = {}       # (a,b,◎) a<b, {a,b} ∩ {〇,▲} ≠ ∅
-st3_ct  = {}       # (sec, thr) with sec in {〇,▲}
+# ワイド / 二車複 / 二車単
+wide_counts = {k:0 for k in all_others}
+qn_counts   = {k:0 for k in all_others}
+ex_counts   = {k:0 for k in all_others}
 
-triC_list = []
-if any(mates):
-    for a in others:
-        for b in others:
-            if a>=b: continue
-            if (a in mates) or (b in mates):
-                triC_list.append(tuple(sorted([a,b,one])))
-    triC_list = sorted(set(triC_list))
+# 三連複（◎-相手-全）
+trio_counts = {}  # key=(om, a, b sorted)
 
-# ===== シミュレーション =====
+# 三連単（◎→相手→全）
+st3_counts = {}   # key=(om, sec, thr)
+
+# ========= シミュレーション =========
 for _ in range(trials):
-    # Top3系
-    ord3 = sample_order(p3)
-    top3 = set(ord3[:3])
-    if one in top3:
-        for k in wide_ct.keys():
+    # Top3系（ワイド/三複）
+    order3 = sample_order_from_probs(probs_p3)
+    top3 = set(order3[:3])
+    if om in top3:
+        for k in all_others:
             if k in top3:
-                wide_ct[k] += 1
-        if len(triC_list)>0:
-            others3 = list(top3 - {one})
-            if len(others3)==2:
-                a, b = sorted(others3)
-                t = tuple(sorted([a,b,one]))
-                if t in triC_list:
-                    triC_ct[t] = triC_ct.get(t,0)+1
+                wide_counts[k] += 1
+        # 三連複：◎+{a,b}（a<b）
+        others = sorted(list(top3 - {om}))
+        if len(others)==2:
+            a,b = others
+            key = tuple(sorted([om, a, b]))
+            trio_counts[key] = trio_counts.get(key, 0) + 1
 
-    # Top2系
-    ord2 = sample_order(p2)
-    top2 = set(ord2[:2])
-    if one in top2:
-        for k in qn_ct.keys():
+    # Top2系（二車複）
+    order2 = sample_order_from_probs(probs_p2)
+    top2 = set(order2[:2])
+    if om in top2:
+        for k in all_others:
             if k in top2:
-                qn_ct[k]+=1
+                qn_counts[k] += 1
 
-    # 1着系
-    ord1 = sample_order(p1)
-    if ord1[0]==one:
-        k2 = ord1[1]
-        if k2 in ex_ct:
-            ex_ct[k2]+=1
-        if k2 in mates and len(ord1)>=3:
-            k3 = ord1[2]
-            if k3 not in (one, k2):
-                st3_ct[(k2,k3)] = st3_ct.get((k2,k3),0)+1
+    # 1着系（二車単/三連単）
+    order1 = sample_order_from_probs(probs_p1)
+    if order1[0] == om:
+        sec = order1[1]
+        if sec in ex_counts:
+            ex_counts[sec] += 1
+        thr = order1[2]
+        if thr != om and thr != sec:
+            key = (om, sec, thr)
+            st3_counts[key] = st3_counts.get(key, 0) + 1
 
-def band_from_cnt(cnt:int) -> str:
-    if cnt<=0: return "-"
-    p = cnt/float(trials)
-    need = 1.0/p
+def _need(cnt): 
+    if cnt <= 0: return None
+    p = cnt / trials
+    return (p, 1.0/p)
+
+def _band_text(need):
+    if need is None: return "-"
     low, high = need*(1.0+E_MIN), need*(1.0+E_MAX)
     return f"{low:.1f}〜{high:.1f}倍"
 
-def need_from_cnt(cnt:int):
-    if cnt<=0: return "-"
-    p = cnt/float(trials)
-    return round(1.0/p, 2)
-
-st.divider()
-st.markdown("### 出力（◎固定 / EV=バランス帯）")
-
-# === ワイド（◎-全）固定表示 ===
+# ========= 出力（◎から固定表示／バランス帯のみ） =========
+st.markdown("### 二車複（◎-全）")
 rows=[]
-for k in sorted(others):
-    cnt = wide_ct[k]; p = cnt/float(trials)
-    need = need_from_cnt(cnt)
-    rows.append({
-        "買い目": f"{one}-{k}",
-        "p(想定)": round(p,4),
-        "必要オッズ(=1/p)": need,
-        "判定": "買い" if p>=P_FLOOR["wide"] and need!="-" else "見送り"
-    })
-df_wide = pd.DataFrame(rows).sort_values(by="買い目", key=lambda s:s.map(_sort_key_nums)).reset_index(drop=True)
-st.markdown("#### ワイド（◎-全）")
-st.dataframe(df_wide, use_container_width=True)
+for k in all_others:
+    p_need = _need(qn_counts[k])
+    if p_need is None or p_need[0] < P_FLOOR["nifuku"]:
+        # Pフロア未満も表示はする（判定廃止）。ただし帯は "-" 表示。
+        rows.append({"買い目": f"{om}-{k}", "的中率(推定p)": f"{(qn_counts[k]/trials):.4f}", "バランス帯": "-"})
+    else:
+        rows.append({"買い目": f"{om}-{k}", "的中率(推定p)": f"{p_need[0]:.4f}", "バランス帯": _band_text(p_need[1])})
+qn_df = pd.DataFrame(rows)
+def _key_nums(s): return list(map(int, re.findall(r"\d+", str(s))))
+st.dataframe(qn_df.sort_values(by="買い目", key=lambda s: s.map(_key_nums)).reset_index(drop=True), use_container_width=True)
 
-# === 二車複（◎-全）固定表示 ===
+st.markdown("### 二車単（◎→全）")
 rows=[]
-for k in sorted(others):
-    cnt = qn_ct[k]; p = cnt/float(trials)
-    rows.append({
-        "買い目": f"{one}-{k}",
-        "p(想定)": round(p,4),
-        "バランス帯": band_from_cnt(cnt),
-        "判定": "買い" if p>=P_FLOOR["nifuku"] else "見送り"
-    })
-df_qn = pd.DataFrame(rows).sort_values(by="買い目", key=lambda s:s.map(_sort_key_nums)).reset_index(drop=True)
-st.markdown("#### 二車複（◎-全）")
-st.dataframe(df_qn, use_container_width=True)
+for k in all_others:
+    p_need = _need(ex_counts[k])
+    if p_need is None or p_need[0] < P_FLOOR["nitan"]:
+        rows.append({"買い目": f"{om}->{k}", "的中率(推定p)": f"{(ex_counts[k]/trials):.4f}", "バランス帯": "-"})
+    else:
+        rows.append({"買い目": f"{om}->{k}", "的中率(推定p)": f"{p_need[0]:.4f}", "バランス帯": _band_text(p_need[1])})
+ex_df = pd.DataFrame(rows)
+st.dataframe(ex_df.sort_values(by="買い目", key=lambda s: s.map(_key_nums)).reset_index(drop=True), use_container_width=True)
 
-# === 二車単（◎→全）固定表示 ===
+st.markdown("### 三連複（◎-[相手]-全）")
 rows=[]
-for k in sorted(others):
-    cnt = ex_ct[k]; p = cnt/float(trials)
-    rows.append({
-        "買い目": f"{one}->{k}",
-        "p(想定)": round(p,4),
-        "バランス帯": band_from_cnt(cnt),
-        "判定": "買い" if p>=P_FLOOR["nitan"] else "見送り"
-    })
-df_ex = pd.DataFrame(rows).sort_values(by="買い目", key=lambda s:s.map(_sort_key_nums)).reset_index(drop=True)
-st.markdown("#### 二車単（◎→全）")
-st.dataframe(df_ex, use_container_width=True)
+# ◎-a-b（a<b, a,b!=◎）を全列挙
+pairs=[]
+for i,a in enumerate(all_others):
+    for b in all_others[i+1:]:
+        key = tuple(sorted([om,a,b]))
+        cnt = trio_counts.get(key, 0)
+        p = cnt / trials
+        if p <= 0 or p < P_FLOOR["sanpuku"]:
+            rows.append({"買い目": f"{om}-{a}-{b}", "的中率(推定p)": f"{p:.5f}", "バランス帯": "-"})
+        else:
+            need = 1.0/p
+            rows.append({"買い目": f"{om}-{a}-{b}", "的中率(推定p)": f"{p:.5f}", "バランス帯": _band_text(need)})
+trio_df = pd.DataFrame(rows)
+st.dataframe(trio_df.sort_values(by="買い目", key=lambda s: s.map(_key_nums)).reset_index(drop=True), use_container_width=True)
 
-# === 三連複C（◎-[相手]-全）===
-st.markdown("#### 三連複C（◎-[相手(〇/▲)]-全）")
-if len(triC_list)>0:
-    rows=[]
-    for t in triC_list:
-        cnt = triC_ct.get(t,0); p = cnt/float(trials)
-        rows.append({
-            "買い目": f"{t[0]}-{t[1]}-{t[2]}",
-            "p(想定)": round(p,5),
-            "バランス帯": band_from_cnt(cnt),
-            "判定": "買い" if p>=P_FLOOR["sanpuku"] else "見送り"
-        })
-    df_triC = pd.DataFrame(rows).sort_values(by="買い目", key=lambda s:s.map(_sort_key_nums)).reset_index(drop=True)
-    st.dataframe(df_triC, use_container_width=True)
-else:
-    st.info("相手（〇/▲）のいずれかが未設定で三連複Cは非表示")
-
-# === 三連単（◎→[相手(〇/▲)]→全）===
-st.markdown("#### 三連単（◎→[相手(〇/▲)]→全）")
+st.markdown("### 三連単（◎→[相手]→全）")
 rows=[]
-for (sec, thr), cnt in st3_ct.items():
-    p = cnt/float(trials)
-    rows.append({
-        "買い目": f"{one}->{sec}->{thr}",
-        "p(想定)": round(p,5),
-        "バランス帯": band_from_cnt(cnt),
-        "判定": "買い" if p>=P_FLOOR["santan"] else "見送り"
-    })
-if rows:
-    df_st = pd.DataFrame(rows).sort_values(by="買い目", key=lambda s:s.map(_sort_key_nums)).reset_index(drop=True)
-    st.dataframe(df_st, use_container_width=True)
-else:
-    st.info("該当なし")
+for sec in all_others:
+    for thr in [t for t in range(1, n_cars+1) if t not in (om, sec)]:
+        key = (om, sec, thr)
+        cnt = st3_counts.get(key, 0)
+        p = cnt / trials
+        if p <= 0 or p < P_FLOOR["santan"]:
+            rows.append({"買い目": f"{om}->{sec}->{thr}", "的中率(推定p)": f"{p:.5f}", "バランス帯": "-"})
+        else:
+            need = 1.0/p
+            rows.append({"買い目": f"{om}->{sec}->{thr}", "的中率(推定p)": f"{p:.5f}", "バランス帯": _band_text(need)})
+st_df = pd.DataFrame(rows)
+st.dataframe(st_df.sort_values(by="買い目", key=lambda s: s.map(_key_nums)).reset_index(drop=True), use_container_width=True)
 
-st.divider()
-st.markdown("### 🔖 note貼り付け用（バランス帯）")
-def to_lines(df: pd.DataFrame, title: str):
-    if df is None or len(df)==0: return f"{title}\n対象外"
-    out=[]
-    for _,r in df.iterrows():
-        name = str(r["買い目"])
-        if "バランス帯" in r and isinstance(r["バランス帯"], str) and r["バランス帯"]!="-":
-            out.append(f"{name}：{r['バランス帯']}")
-        elif "必要オッズ(=1/p)" in r and r["必要オッズ(=1/p)"]!="-":
-            out.append(f"{name}：{r['必要オッズ(=1/p)']}倍以上")
-    out = sorted(out, key=_sort_key_nums)
-    return f"{title}\n" + "\n".join(out) if out else f"{title}\n対象外"
+st.markdown("### ワイド（◎-全）")
+rows=[]
+for k in all_others:
+    cnt = wide_counts[k]
+    p = cnt / trials
+    if p <= 0 or p < P_FLOOR["wide"]:
+        rows.append({"買い目": f"{om}-{k}", "的中率(推定p)": f"{p:.4f}", "バランス帯": "-"})
+    else:
+        need = 1.0/p
+        rows.append({"買い目": f"{om}-{k}", "的中率(推定p)": f"{p:.4f}", "バランス帯": _band_text(need)})
+wide_df = pd.DataFrame(rows)
+st.dataframe(wide_df.sort_values(by="買い目", key=lambda s: s.map(_key_nums)).reset_index(drop=True), use_container_width=True)
 
-txt = []
-txt.append(to_lines(df_qn,  "二車複（◎-全）"))
-txt.append(to_lines(df_ex,  "二車単（◎→全）"))
-if 'df_triC' in locals():
-    txt.append(to_lines(df_triC, "三連複C（◎-[相手]-全）"))
-txt.append(to_lines(df_wide, "ワイド（◎-全）"))
-if 'df_st' in locals():
-    txt.append(to_lines(df_st,  "三連単（◎→[相手]→全）"))
+# ========= 注釈（説明） =========
+st.markdown("""
+**注記**  
+- ここに表示する「バランス帯」は、`必要オッズ(=1/p)` に対して **+10%〜+60%** の幅をかけた参考レンジです。  
+- **この帯より安いオッズ（低倍率）は期待値が不足する想定** です。逆に、帯から大きく離れて高倍率になるほど **的中率とのバランスが崩れリスク増** と見なします。  
+- 本ツールは印の相対関係だけを使う簡易版です。選手能力やライン情報は反映していません。
+""")
 
-note_text = "\n\n".join(txt) + "\n\n" + \
-    "※このオッズ**以下**は期待値未満を想定しています。また、この帯から極端な高オッズに離れるほど、的中率とのバランスが崩れハイリスクになります。"
+# ========= note貼り付け用（見出し＋買い目だけ） =========
+def _section_lines(df: pd.DataFrame, title: str) -> list[str]:
+    if df is None or df.empty: 
+        return [f"{title}", "対象外"]
+    out = [title]
+    for _, r in df.iterrows():
+        out.append(f"{r['買い目']}：{r['バランス帯']}")
+    return out
 
-st.text_area("コピー用テキスト", note_text, height=360)
+marks_line = " ".join(f"{mk}{car}" for mk,car in marks_input.items())
+note_text = "\n".join(
+    ["印　"+marks_line, ""] +
+    _section_lines(qn_df,   "二車複（◎-全）") + [""] +
+    _section_lines(ex_df,   "二車単（◎→全）") + [""] +
+    _section_lines(trio_df, "三連複（◎-[相手]-全）") + [""] +
+    _section_lines(st_df,   "三連単（◎→[相手]→全）") + [""] +
+    _section_lines(wide_df, "ワイド（◎-全）") + ["",
+    "（※表示は全通り。Pフロア未満は “-” 表示）"]
+)
 
-
+st.markdown("### 📋 note貼り付け用（買い目＋バランス帯）")
+st.text_area("ここを選択してコピー", value=note_text, height=320)
